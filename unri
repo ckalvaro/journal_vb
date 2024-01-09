@@ -1,0 +1,544 @@
+'NXJournaling.com
+'NXdwg_to_dxf.vb
+'   purpose: this journal automates the tried and true method of exporting a dxf file: export cgm, import cgm, export dxf
+'
+'   Requirements: This journal will work in Teamcenter (TC) or native environments.
+'                   TC:     Create a new dataset and file (in TC) dedicated to cgm import/dxf export, this file will be reused for each dxf export.
+'                           All users who will be running this journal must have read/write access to this file.
+'                           Modify the line: {Const tempTCDXF = "..."} in Sub Main() to point to this new file
+'                   native: No special requirements, but highly customized environments may conflict with some settings in the journal.
+'                           In particular, this journal uses the 'blank' template to create a temporary dxf export file;
+'                           if this template file has been moved or renamed, errors may occur.
+'
+'revised on March 7, 2013: updated cgm import to use wrapped UF function rather than .NET version, which is creating a drawing sheet
+'		CGM import was flaky under NX8 and NX8.5, works fine with NX7.5 and below
+'		reference IR 6848806
+'
+'   Please send comments, suggestions, and/or bug reports to info@nxjournaling.com
+ 
+Option Strict Off
+Imports System
+Imports NXOpen
+Imports NXOpen.UF
+Imports System.IO
+Imports System.Windows.Forms
+ 
+Module NXJournal
+ 
+    Dim theSession As Session = Session.GetSession()
+    Dim workPart As Part = theSession.Parts.Work
+    Dim displayPart As Part = theSession.Parts.Display
+    Dim ufs As UFSession = UFSession.GetUFSession()
+    Dim dxfSettingsFile As String
+    Dim criticalError As Boolean = False
+    Dim lw As ListingWindow = theSession.ListingWindow
+    Dim lg As LogFile = theSession.LogFile
+ 
+    '**********************************************************
+ 
+    Sub Main()
+ 
+        Dim dwgs As Drawings.DrawingSheetCollection
+        dwgs = workPart.DrawingSheets
+        Dim sheet As Drawings.DrawingSheet
+        Dim i As Integer = 0
+        Dim n As Integer = 0
+        Dim tempCGMFile As String
+        Dim tempNewFile As String
+        Dim dxfFile As String
+        Dim currentPath As String
+        Dim currentFile As String
+        Dim originalFile As String
+        Dim originalPart As Part
+        Dim killList() As String
+        Dim partUnits As Integer
+        Dim strOutputFolder As String
+        Dim rsp
+        Dim strRevision As String
+        Dim exportFile As String
+        lw.Open()
+ 
+        '%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+        'if running Teamcenter, change this to point to your temp import/export dataset file
+        Const tempTCDXF = "@DB@123/dwg2dxf@A"
+        '%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+ 
+        lg.WriteLine("~ Start of drawing to DXF journal ~")
+ 
+        'Get UG install directory using NXOpen API
+        Dim DXFDWG_DIR As String = theSession.GetEnvironmentVariableValue("DXFDWG_DIR")
+        dxfSettingsFile = IO.Path.Combine(DXFDWG_DIR, "dxfdwg.def")
+        lg.WriteLine("looking for dxf settings file: " & dxfSettingsFile)
+        'check if the dxfSettingsFile exists
+        If Not File.Exists(dxfSettingsFile) Then
+            'file does not exist in default directory or user specified directory
+            lg.WriteLine("The dxf settings file was not found in the specified location: " & dxfSettingsFile)
+            MsgBox("The dxf settings file (dxfdwg.def) was not found." & vbCrLf & _
+                "This journal will now exit.", vbOKOnly + vbCritical, "Error")
+            Exit Sub
+        End If
+        lg.WriteLine("DXF settings file found: " & dxfSettingsFile)
+ 
+        'determine if we are running under TC or native
+        Dim IsTcEng As Boolean = False
+        ufs.UF.IsUgmanagerActive(IsTcEng)
+        lg.WriteLine("TC running? " & IsTcEng)
+ 
+        originalPart = displayPart
+ 
+        If IsTcEng Then
+            lg.WriteLine("tempTCDXF: " & tempTCDXF)
+            currentFile = workPart.GetStringAttribute("DB_PART_NO")
+            strRevision = workPart.GetStringAttribute("DB_PART_REV")
+            originalFile = "@DB/" & currentFile & "/" & strRevision
+ 
+            currentFile = currentFile.Replace("/", "_")
+            currentFile = currentFile & "_" & strRevision
+ 
+        Else 'running in native mode
+            currentPath = Path.GetDirectoryName(workPart.FullPath)
+            currentFile = Path.GetFileNameWithoutExtension(workPart.FullPath)
+            originalFile = currentFile
+ 
+            Try
+                strRevision = workPart.GetStringAttribute("REVISION")
+                strRevision = Trim(strRevision)
+            Catch ex As NXOpen.NXException
+                If ex.ErrorCode = 512008 Then
+                    lg.WriteLine("Revision attribute not found")
+                Else
+                    lg.WriteLine("Error: " & ex.ErrorCode & " " & ex.GetType.ToString & " : " & ex.Message)
+                End If
+                strRevision = ""
+            End Try
+            If strRevision <> "" Then
+                currentFile = currentFile & "_" & strRevision
+            End If
+        End If
+        exportFile = currentFile
+ 
+        lg.WriteLine("workPart.FullPath: " & workPart.FullPath)
+        lg.WriteLine("currentFile: " & currentFile)
+        lg.WriteLine("strRevision: " & strRevision)
+        lg.WriteLine("originalFile: " & originalFile)
+        lg.WriteLine("originalPart: " & originalPart.FullPath)
+ 
+        partUnits = workPart.PartUnits
+        '0 = inch
+        '1 = metric
+ 
+        lg.WriteLine("Part units: " & workPart.PartUnits.ToString)
+ 
+        Dim FolderBrowserDialog1 As New FolderBrowserDialog
+ 
+        ' Then use the following code to create the Dialog window
+        ' Change the .SelectedPath property to the default location
+        With FolderBrowserDialog1
+            ' Desktop is the root folder in the dialog.
+            .RootFolder = Environment.SpecialFolder.Desktop
+            ' Select the C:\ directory on entry.
+            .SelectedPath = "C:\"
+            ' Prompt the user with a custom message.
+            .Description = "Select the directory to export .dxf file(s)"
+            If .ShowDialog = DialogResult.OK Then
+                strOutputFolder = .SelectedPath
+            Else
+                Exit Sub
+            End If
+        End With
+ 
+        lg.WriteLine("Output folder: " & strOutputFolder)
+ 
+        For Each sheet In dwgs
+            i += 1
+ 
+            'in original file, export each drawing sheet as a .cgm file
+ 
+            'prepare for CGM export
+            tempCGMFile = Path.Combine(strOutputFolder, currentFile & "_" & i & ".cgm")
+            lg.WriteLine("Exporting temp CGM file: " & tempCGMFile)
+ 
+            If File.Exists(tempCGMFile) Then
+                lg.WriteLine(tempCGMFile & " already exists, deleting file before export")
+                Try
+                    File.Delete(tempCGMFile)
+                Catch ex As UnauthorizedAccessException
+                    lg.WriteLine("Unauthorized access exception, cannot delete file: " & tempCGMFile)
+                    lg.WriteLine("Please check permissions on the file and folder(s) and try again")
+                    lg.WriteLine("Drawing to DXF journal will now exit")
+                    MsgBox("Error: cannot delete file: " & tempCGMFile, MsgBoxStyle.Critical, "Unauthorized access exception")
+                    Exit Sub
+                Catch ex As ApplicationException
+                    lg.WriteLine("Error occurred while attempting to delete file: " & tempCGMFile)
+                    lg.WriteLine(ex.GetType.ToString & " : " & ex.Message)
+                    MsgBox("Error occurred while attempting to delete file: " & tempCGMFile & vbCrLf & "Drawing to DXF journal will now exit", MsgBoxStyle.Critical, "Error")
+                End Try
+ 
+            End If
+ 
+            Try
+                ExportCGM(sheet, tempCGMFile, partUnits)
+            Catch ex As Exception
+                MsgBox("Error occurred in CGM export" & vbCrLf & ex.GetType.ToString & " : " & ex.Message & vbCrLf & "journal exiting", vbCritical + vbOKOnly, "Error")
+                lg.WriteLine("Error occurred in CGM export: " & ex.GetType.ToString & " : " & ex.Message)
+                Exit Sub
+            End Try
+ 
+            'import .cgm file to temporary file in preparation for .dxf export
+            If IsTcEng Then
+                Dim partLoadStatus1 As PartLoadStatus
+ 
+                Try
+                    lg.WriteLine("theSession.Parts.SetNonmasterSeedPartData(" & tempTCDXF & ")")
+                    theSession.Parts.SetNonmasterSeedPartData(tempTCDXF)
+ 
+                    Dim basePart1 As BasePart
+                    lg.WriteLine("Opening part: " & tempTCDXF)
+ 
+                    basePart1 = theSession.Parts.OpenBaseDisplay(tempTCDXF, partLoadStatus1)
+                    lg.WriteLine(tempTCDXF & " load status: " & partLoadStatus1.ToString)
+ 
+                Catch ex As Exception
+                    MsgBox("An error occurred while opening the temp dxf import part" & vbCrLf & ex.GetType.ToString & " : " & ex.Message, vbCritical + vbOKOnly, "Error")
+                    lg.WriteLine(tempTCDXF & " load status: " & partLoadStatus1.ToString)
+                    lg.WriteLine("An error occurred while opening: " & tempTCDXF & " " & ex.GetType.ToString & " : " & ex.Message)
+                    Exit Sub
+                Finally
+                    partLoadStatus1.Dispose()
+                End Try
+ 
+            Else
+                'create a new file to import the CGM
+                tempNewFile = strOutputFolder & "\" & currentFile & "_" & i & ".prt"
+ 
+                lg.WriteLine("tempNewFile: " & tempNewFile)
+ 
+                If File.Exists(tempNewFile) Then
+                    lg.WriteLine("tempNewFile already exists: " & tempNewFile)
+                    rsp = MsgBox("The file: '" & tempNewFile & "' already exists; overwrite?", vbYesNo + vbQuestion, "File exists")
+                    If rsp = vbYes Then
+                        lg.WriteLine("user has chosen to overwrite: " & tempNewFile)
+                        Try
+                            lg.WriteLine("attempting to delete: " & tempNewFile)
+                            File.Delete(tempNewFile)
+                        Catch ex As UnauthorizedAccessException
+                            lg.WriteLine("Unauthorized access exception, check permissions on: " & tempNewFile & " and try again")
+                            MsgBox("Unable to delete file: " & tempNewFile & vbCrLf & "Drawing to DXF journal will now exit", MsgBoxStyle.Critical, "Unauthorized Access Exception")
+                            Exit Sub
+                        Catch ex As ApplicationException
+                            lg.WriteLine("An exception occurred while attempting to delete file: " & tempNewFile)
+                            lg.WriteLine(ex.GetType.ToString & " : " & ex.Message)
+                            lg.WriteLine("Drawing to DXF journal will now exit")
+                            MsgBox("An exception occurred while attempting to delete file: " & tempNewFile & vbCrLf & "Drawing to DXF journal will now exit", MsgBoxStyle.Critical, "Error")
+                            Exit Sub
+                        End Try
+ 
+                    Else
+                        lg.WriteLine("User chose not to overwrite the existing file: " & tempNewFile)
+                        lg.WriteLine("Drawing to DXF journal will now exit")
+                        MsgBox("journal exiting", vbOKOnly, "Export cancelled")
+                        Exit Sub
+                    End If
+                End If
+                Try
+                    lg.WriteLine("Attempting to create temporary cgm import file: " & tempNewFile)
+                    NewFile(tempNewFile, partUnits)
+                Catch ex As Exception
+                    lg.WriteLine("Error in temporary cgm import file creation: " & tempNewFile)
+                    lg.WriteLine(ex.GetType.ToString & " : " & ex.Message)
+                    lg.WriteLine("Drawing to DXF journal will now exit")
+                    MsgBox("Error occurred in new file creation" & vbCrLf & ex.Message & vbCrLf & "journal exiting", vbCritical + vbOKOnly, "Error")
+                    Exit Sub
+                End Try
+ 
+            End If
+ 
+            'now in temporary dxf import file
+ 
+            workPart = theSession.Parts.Work
+            displayPart = theSession.Parts.Display
+            lg.WriteLine("work part: " & theSession.Parts.Work.FullPath)
+ 
+            'turn off the display of the drawing sheet, some users report errors if the sheet is displayed when the view is replaced
+            '1 = Modeling view
+            '2 = Drawing view
+            ufs.Draw.SetDisplayState(1)
+            'replace view to "TOP" before importing the CGM
+            'this gives better results with fixed view drawing viewers such as edrawings
+            Dim layout1 As Layout = CType(theSession.Parts.Work.Layouts.Current, Layout)
+            lg.WriteLine("current layout: " & layout1.Name)
+            Dim modelingView1 As ModelingView = CType(theSession.Parts.Work.ModelingViews.FindObject("TOP"), ModelingView)
+            lg.WriteLine("modelingView1: " & modelingView1.Name)
+            layout1.ReplaceView(theSession.Parts.Work.ModelingViews.WorkView, modelingView1, True)
+ 
+            'Call the ImportCGM subroutine
+            workPart.Layers.WorkLayer = 1
+            lg.WriteLine("Calling the ImportCGM(" & tempCGMFile & ")")
+            ImportCGM(tempCGMFile)
+            lg.WriteLine("Saving temporary cgm import file: " & tempCGMFile)
+            workPart.Save(BasePart.SaveComponents.False, BasePart.CloseAfterSave.False)
+ 
+            If IsTcEng Then
+                ReDim Preserve killList(i)
+                killList(i) = tempCGMFile
+                lg.WriteLine("Adding file to kill list: " & tempCGMFile)
+            Else
+                'add the temp files to the kill list
+                ReDim Preserve killList(i * 2)
+                killList(i * 2 - 1) = tempCGMFile
+                killList(i * 2) = tempNewFile
+                lg.WriteLine("Adding file to kill list: " & tempCGMFile)
+                lg.WriteLine("Adding file to kill list: " & tempNewFile)
+ 
+            End If
+ 
+            dxfFile = Path.Combine(strOutputFolder, currentFile & "_" & i & ".dxf")
+            lg.WriteLine("DXF file: " & dxfFile)
+ 
+            If File.Exists(dxfFile) Then
+                rsp = MsgBox("The file: '" & dxfFile & "' already exists; overwrite?", vbYesNo + vbQuestion, "File exists")
+                lg.WriteLine("The specified DXF output file already exists")
+                If rsp = vbYes Then
+                    lg.WriteLine("user has chosen to overwrite the existing DXF file")
+                    Try
+                        File.Delete(dxfFile)
+                    Catch ex As UnauthorizedAccessException
+                        lg.WriteLine("Unauthorized access exception, cannot delete file: " & dxfFile)
+                        lg.WriteLine("Please check permissions on the file and folder(s) and try again")
+                        lg.WriteLine("Drawing to DXF journal will now exit")
+                        MsgBox("Error: cannot delete file: " & dxfFile & vbCrLf & "Please check permissions on the file and try again", MsgBoxStyle.Critical, "Unauthorized access exception")
+                        Exit Sub
+                    Catch ex As ApplicationException
+                        lg.WriteLine("Error occurred while attempting to delete file: " & dxfFile)
+                        lg.WriteLine(ex.GetType.ToString & " : " & ex.Message)
+                        MsgBox("Error occurred while attempting to delete file: " & dxfFile & vbCrLf & "Drawing to DXF journal will now exit", MsgBoxStyle.Critical, "Error")
+                    End Try
+                Else
+                    lg.WriteLine("user chose not to overwrite existing DXF file")
+                    lg.WriteLine("Drawing to DXF journal will now exit")
+                    MsgBox("Journal will now exit", MsgBoxStyle.Exclamation, "Export cancelled")
+                    Exit Sub
+                End If
+            End If
+ 
+            Try
+                'Call ExportDXF subroutine
+                lg.WriteLine("Calling export DXF routine")
+                If IsTcEng Then
+                    lg.WriteLine("ExportDXF(" & tempTCDXF & ", " & dxfFile & ")")
+                    ExportDXF(tempTCDXF, dxfFile)
+                Else
+                    lg.WriteLine("ExportDXF(" & tempNewFile & ", " & dxfFile & ")")
+                    ExportDXF(tempNewFile, dxfFile)
+                End If
+ 
+                lg.WriteLine("Waiting on creation of DXF file...")
+                While Not File.Exists(dxfFile)
+                    Application.DoEvents()
+                End While
+                lg.WriteLine("DXF file created: " & dxfFile)
+ 
+            Catch ex As Exception
+                MsgBox("Error occurred in DXF export" & vbCrLf & ex.Message & vbCrLf & "journal exiting", vbCritical + vbOKOnly, "Error")
+                lg.WriteLine("Error in DXF export: " & ex.GetType.ToString & " : " & ex.Message)
+                lg.WriteLine("Drawing to DXF journal will now exit")
+                Exit Sub
+            Finally
+                lg.WriteLine("deleting temporary objects from: " & workPart.FullPath)
+                Dim markId1 As Session.UndoMarkId
+                markId1 = theSession.SetUndoMark(Session.MarkVisibility.Invisible, "Start")
+                'delete all imported objects (all objects on layer 1)
+                Dim importEntities() As NXObject
+                importEntities = workPart.Layers.GetAllObjectsOnLayer(1)
+                Dim nErrs1 As Integer
+                nErrs1 = theSession.UpdateManager.AddToDeleteList(importEntities)
+                Dim nErrs2 As Integer
+                nErrs2 = theSession.UpdateManager.DoUpdate(markId1)
+                'close the temporary DXF file
+                lg.WriteLine("Closing the temporary dxf file")
+                workPart.Save(BasePart.SaveComponents.False, BasePart.CloseAfterSave.True)
+            End Try
+ 
+            'make the original part the displayed part
+            Dim partLoadStatus2 As PartLoadStatus
+            Dim status1 As PartCollection.SdpsStatus
+            status1 = theSession.Parts.SetDisplay(originalPart, False, True, partLoadStatus2)
+            lg.WriteLine("make original part the displayed part")
+            lg.WriteLine("status1: " & status1.ToString)
+            workPart = theSession.Parts.Work
+            displayPart = theSession.Parts.Display
+            partLoadStatus2.Dispose()
+            lg.WriteLine("current display part: " & displayPart.FullPath)
+ 
+        Next
+ 
+        If i = 0 Then
+            lg.WriteLine("This part has no drawing sheets to export")
+            MsgBox("This part has no drawing sheets to export", MsgBoxStyle.Exclamation, "Huh?")
+        Else
+            'cleanup temp files
+            lg.WriteLine("Cleaning up temporary files")
+            Dim j As Integer
+            j = 1
+            If IsTcEng Then
+                For j = 1 To i
+                    File.Delete(killList(j))
+                    lg.WriteLine("File deleted: " & killList(j))
+                Next
+            Else
+                For j = 1 To i * 2
+                    File.Delete(killList(j))
+                    lg.WriteLine("File deleted: " & killList(j))
+                Next
+ 
+            End If
+            MsgBox("Exported: " & i & " sheets as dxf files", vbOKOnly + vbInformation, "Success!")
+            lg.WriteLine("Exported: " & i & " sheets as dxf files")
+        End If
+ 
+        lg.WriteLine("~ End of drawing to DXF export journal ~")
+ 
+        lw.Close()
+ 
+    End Sub
+ 
+    '**********************************************************
+    Sub ExportCGM(ByVal dwg As Drawings.DrawingSheet, ByVal outputFile As String, ByVal units As Integer)
+ 
+        Dim filenames1(0) As String
+        Dim objCGM As CGMBuilder
+        objCGM = theSession.Parts.Work.PlotManager.CreateCgmBuilder()
+ 
+        objCGM.Action = CGMBuilder.ActionOption.FileBrowser
+ 
+        objCGM.OutputText = CGMBuilder.OutputTextOption.Polylines
+        If units = 0 Then
+            objCGM.Units = CGMBuilder.UnitsOption.English
+        Else
+            objCGM.Units = CGMBuilder.UnitsOption.Metric
+        End If
+        objCGM.XDimension = dwg.Height
+        objCGM.YDimension = dwg.Length
+        objCGM.VdcCoordinates = CGMBuilder.Vdc.Real
+        objCGM.RasterImages = True
+ 
+        Dim sheets1(0) As NXObject
+        sheets1(0) = dwg
+        objCGM.SourceBuilder.SetSheets(sheets1)
+ 
+        filenames1(0) = outputFile
+        objCGM.SetFilenames(filenames1)
+ 
+        Try
+            Dim nXObject1 As NXObject
+            nXObject1 = objCGM.Commit()
+        Catch ex As Exception
+            lg.WriteLine("Error in ExportCGM subroutine: " & ex.GetType.ToString & " : " & ex.Message)
+        Finally
+            objCGM.Destroy()
+        End Try
+ 
+    End Sub
+ 
+    '**********************************************************
+    Sub ExportDXF(ByVal inputFile As String, ByVal outputFile As String)
+ 
+        Dim dxfdwgCreator1 As DxfdwgCreator
+        dxfdwgCreator1 = theSession.DexManager.CreateDxfdwgCreator()
+        dxfdwgCreator1.SettingsFile = dxfSettingsFile
+        dxfdwgCreator1.InputFile = inputFile
+        dxfdwgCreator1.OutputFile = outputFile
+        dxfdwgCreator1.FileSaveFlag = False
+        dxfdwgCreator1.ObjectTypes.Curves = True
+        dxfdwgCreator1.ObjectTypes.Annotations = True
+        dxfdwgCreator1.ObjectTypes.Structures = True
+        'next line controls dxf file version
+        dxfdwgCreator1.AutoCADRevision = DxfdwgCreator.AutoCADRevisionOptions.R2004
+        dxfdwgCreator1.FlattenAssembly = False
+        dxfdwgCreator1.ViewEditMode = True
+        dxfdwgCreator1.LayerMask = "1-256"
+        dxfdwgCreator1.DrawingList = ""
+        dxfdwgCreator1.ViewList = "TOP,FRONT,RIGHT,BACK,BOTTOM,LEFT,TFR-ISO,TFR-TRI"
+        'dxfdwgCreator1.SetUserCredential("", "", "")
+ 
+        Try
+            Dim nXObject1 As NXObject
+            nXObject1 = dxfdwgCreator1.Commit()
+        Catch ex As Exception
+            MsgBox("Error in DXF export subroutine" & vbCrLf & ex.GetType.ToString & " : " & ex.Message, MsgBoxStyle.Critical + MsgBoxStyle.OkOnly, "DXF export error")
+            lg.WriteLine("Error in ExportDXF subroutine: " & ex.GetType.ToString & " : " & ex.Message)
+        Finally
+            dxfdwgCreator1.Destroy()
+        End Try
+ 
+    End Sub
+ 
+    '**********************************************************
+    Sub NewFile(ByVal fullpath As String, ByVal units As Integer)
+ 
+        Dim fileNew1 As FileNew
+        fileNew1 = theSession.Parts.FileNew()
+ 
+        'fileNew1.TemplateFileName = "Blank"
+        fileNew1.Application = FileNewApplication.Gateway
+        If units = 0 Then
+            fileNew1.Units = Part.Units.Inches
+        Else
+            fileNew1.Units = Part.Units.Millimeters
+        End If
+        fileNew1.NewFileName = fullpath
+        'fileNew1.MasterFileName = ""
+        fileNew1.UseBlankTemplate = True
+        fileNew1.MakeDisplayedPart = True
+ 
+        Try
+            Dim nXObject2 As NXObject
+            nXObject2 = fileNew1.Commit()
+        Catch ex As Exception
+            lg.WriteLine("Error in NewFile subroutine: " & ex.GetType.ToString & " : " & ex.Message)
+        Finally
+            workPart = theSession.Parts.Work
+            displayPart = theSession.Parts.Display
+            fileNew1.Destroy()
+        End Try
+ 
+    End Sub
+ 
+    '**********************************************************
+    Sub ImportCGM(ByVal cgmFile As String)
+ 
+'  The .NET function for cgm import changed in NX8
+'  reference IR 6848806
+'	
+'        Dim importer1 As Importer
+'        importer1 = theSession.Parts.Work.ImportManager.CreateCgmImporter()
+'        importer1.FileName = cgmFile
+'        Try
+'            Dim nXObject3 As NXObject
+'            nXObject3 = importer1.Commit()
+'        Catch ex As Exception
+'            lg.WriteLine("Error in ImportCGM subroutine: " & ex.GetType.ToString & ex.Message)
+'        Finally
+'            importer1.Destroy()
+'        End Try
+ 
+		Dim import_options As UFCgm.ImportOptions
+		ufs.Cgm.InitImportOptions(import_options)
+		import_options.allow_new_drawing = false
+		Try
+			ufs.Cgm.ImportCgm(cgmFile, import_options )
+		Catch ex As Exception
+			lg.WriteLine("Error in ImportCGM subroutine: " & ex.GetType.ToString & ex.Message)
+		End Try
+ 
+    End Sub
+ 
+    '**********************************************************
+    Public Function GetUnloadOption(ByVal dummy As String) As Integer
+ 
+        'Unloads the image when the NX session terminates
+        GetUnloadOption = NXOpen.Session.LibraryUnloadOption.AtTermination
+ 
+    End Function
+ 
+End Module
